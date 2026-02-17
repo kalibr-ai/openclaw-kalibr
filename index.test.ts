@@ -6,6 +6,15 @@ vi.mock("@kalibr/sdk", () => ({
     init: vi.fn(),
   },
   reportOutcome: vi.fn().mockResolvedValue({ success: true }),
+  decide: vi.fn().mockResolvedValue({
+    path_id: "path-1",
+    model_id: "claude-sonnet-4-5",
+    reason: "highest success rate",
+    confidence: 0.92,
+    exploration: false,
+    success_rate: 0.95,
+    sample_count: 150,
+  }),
 }));
 
 import plugin from "./index.js";
@@ -15,7 +24,7 @@ import type { KalibrConfig } from "./index.js";
 
 interface HookRegistration {
   name: string;
-  handler: (event: unknown, ctx?: unknown) => void | Promise<void>;
+  handler: (event: unknown, ctx?: unknown) => unknown | Promise<unknown>;
   opts?: { priority?: number };
 }
 
@@ -42,7 +51,6 @@ function createMockApi(config: KalibrConfig) {
       info: vi.fn(),
       warn: vi.fn(),
       error: vi.fn(),
-      debug: vi.fn(),
     },
     on: vi.fn((name: string, handler: HookRegistration["handler"], opts?: { priority?: number }) => {
       hooks.push({ name, handler, opts });
@@ -73,6 +81,11 @@ describe("plugin", () => {
     expect(plugin.name).toBe("Kalibr Intelligence");
   });
 
+  it("uses export default", async () => {
+    const mod = await import("./index.js");
+    expect(mod.default).toBe(plugin);
+  });
+
   describe("register()", () => {
     it("does not register anything when enabled is false", () => {
       const { api } = createMockApi({ apiKey: "test", enabled: false });
@@ -81,7 +94,13 @@ describe("plugin", () => {
       expect(api.registerCommand).not.toHaveBeenCalled();
     });
 
-    it("registers all hooks when fully enabled", async () => {
+    it("registers when enabled is undefined (default)", () => {
+      const { api } = createMockApi({ apiKey: "test" });
+      plugin.register(api as never);
+      expect(api.on).toHaveBeenCalled();
+    });
+
+    it("registers all telemetry + outcome hooks when fully enabled", async () => {
       const { api, hooks } = createMockApi({
         apiKey: "test-key",
         captureLlmTelemetry: true,
@@ -89,8 +108,6 @@ describe("plugin", () => {
       });
 
       plugin.register(api as never);
-
-      // Wait a tick for the async SDK init
       await new Promise((r) => setTimeout(r, 10));
 
       const hookNames = hooks.map((h) => h.name);
@@ -128,6 +145,161 @@ describe("plugin", () => {
       expect(hookNames).toContain("llm_output");
       expect(hookNames).not.toContain("agent_end");
     });
+
+    it("does not register before_agent_start when enableRouting is not true", () => {
+      const { api, hooks } = createMockApi({ apiKey: "test" });
+      plugin.register(api as never);
+
+      const hookNames = hooks.map((h) => h.name);
+      expect(hookNames).not.toContain("before_agent_start");
+    });
+
+    it("registers before_agent_start when enableRouting is true", () => {
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+      });
+      plugin.register(api as never);
+
+      const hookNames = hooks.map((h) => h.name);
+      expect(hookNames).toContain("before_agent_start");
+    });
+
+    it("calls api.logger.info directly (logger is not optional)", async () => {
+      const { api } = createMockApi({ apiKey: "test" });
+      plugin.register(api as never);
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(api.logger.info).toHaveBeenCalledWith("[kalibr] Plugin registered");
+    });
+  });
+
+  describe("before_agent_start hook (routing)", () => {
+    it("calls decide() and returns modelOverride/providerOverride", async () => {
+      const sdk = await import("@kalibr/sdk");
+      const mockDecide = sdk.decide as ReturnType<typeof vi.fn>;
+      mockDecide.mockClear();
+      mockDecide.mockResolvedValueOnce({
+        path_id: "path-1",
+        model_id: "claude-sonnet-4-5",
+        reason: "best",
+        confidence: 0.9,
+        exploration: false,
+      });
+
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+        defaultGoal: "my_goal",
+      });
+      plugin.register(api as never);
+
+      // Wait for SDK init
+      await new Promise((r) => setTimeout(r, 50));
+
+      const handler = findHook(hooks, "before_agent_start")!.handler;
+      const result = await handler(
+        { prompt: "hello" },
+        { sessionKey: "sk-1" },
+      );
+
+      expect(mockDecide).toHaveBeenCalledWith("my_goal");
+      expect(result).toEqual({
+        modelOverride: "claude-sonnet-4-5",
+        providerOverride: "anthropic",
+      });
+    });
+
+    it("returns empty object when decide() returns unknown model_id", async () => {
+      const sdk = await import("@kalibr/sdk");
+      const mockDecide = sdk.decide as ReturnType<typeof vi.fn>;
+      mockDecide.mockClear();
+      mockDecide.mockResolvedValueOnce({
+        path_id: "path-2",
+        model_id: "unknown-model-xyz",
+        reason: "test",
+        confidence: 0.5,
+        exploration: true,
+      });
+
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+      });
+      plugin.register(api as never);
+      await new Promise((r) => setTimeout(r, 50));
+
+      const handler = findHook(hooks, "before_agent_start")!.handler;
+      const result = await handler({ prompt: "hello" }, {});
+
+      expect(result).toEqual({});
+      expect(api.logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("unknown model_id: unknown-model-xyz"),
+      );
+    });
+
+    it("returns empty object when decide() throws", async () => {
+      const sdk = await import("@kalibr/sdk");
+      const mockDecide = sdk.decide as ReturnType<typeof vi.fn>;
+      mockDecide.mockClear();
+      mockDecide.mockRejectedValueOnce(new Error("network timeout"));
+
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+      });
+      plugin.register(api as never);
+      await new Promise((r) => setTimeout(r, 50));
+
+      const handler = findHook(hooks, "before_agent_start")!.handler;
+      const result = await handler({ prompt: "hello" }, {});
+
+      expect(result).toEqual({});
+      expect(api.logger.error).toHaveBeenCalledWith(
+        expect.stringContaining("decide() failed"),
+      );
+    });
+
+    it("returns empty object when SDK is not ready", async () => {
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+      });
+      plugin.register(api as never);
+
+      const handler = findHook(hooks, "before_agent_start")!.handler;
+      const result = await handler({ prompt: "hello" }, {});
+
+      expect(result).toEqual({});
+    });
+
+    it("handles model_id that already contains slash (passthrough)", async () => {
+      const sdk = await import("@kalibr/sdk");
+      const mockDecide = sdk.decide as ReturnType<typeof vi.fn>;
+      mockDecide.mockClear();
+      mockDecide.mockResolvedValueOnce({
+        path_id: "path-3",
+        model_id: "google/gemini-ultra",
+        reason: "test",
+        confidence: 0.8,
+        exploration: false,
+      });
+
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+      });
+      plugin.register(api as never);
+      await new Promise((r) => setTimeout(r, 50));
+
+      const handler = findHook(hooks, "before_agent_start")!.handler;
+      const result = await handler({ prompt: "hello" }, {});
+
+      expect(result).toEqual({
+        modelOverride: "gemini-ultra",
+        providerOverride: "google",
+      });
+    });
   });
 
   describe("llm_input hook", () => {
@@ -136,7 +308,6 @@ describe("plugin", () => {
       plugin.register(api as never);
 
       const handler = findHook(hooks, "llm_input")!.handler;
-      // Should not throw — just silently return
       await handler(
         { runId: "r1", sessionId: "s1", provider: "anthropic", model: "m1", prompt: "p", historyMessages: [], imagesCount: 0 },
         { /* no sessionKey */ },
@@ -152,7 +323,6 @@ describe("plugin", () => {
         { runId: "r1", sessionId: "s1", provider: "anthropic", model: "anthropic/claude-sonnet-4-5", prompt: "p", historyMessages: [], imagesCount: 0 },
         { sessionKey: "sk-1" },
       );
-      // No assertion on internal state; we verify via agent_end integration below
     });
   });
 
@@ -162,7 +332,6 @@ describe("plugin", () => {
       plugin.register(api as never);
 
       const handler = findHook(hooks, "llm_output")!.handler;
-      // Event with no usage at all
       await handler(
         { runId: "r1", sessionId: "s1", provider: "anthropic", model: "m1", assistantTexts: ["hello"] },
         { sessionKey: "sk-1" },
@@ -193,7 +362,6 @@ describe("plugin", () => {
       });
       plugin.register(api as never);
 
-      // Simulate llm_input + llm_output + agent_end
       const inputHandler = findHook(hooks, "llm_input")!.handler;
       const outputHandler = findHook(hooks, "llm_output")!.handler;
       const endHandler = findHook(hooks, "agent_end")!.handler;
@@ -215,23 +383,16 @@ describe("plugin", () => {
         ctx,
       );
 
-      // Wait for async reportOutcome
       await new Promise((r) => setTimeout(r, 50));
 
       expect(mockReportOutcome).toHaveBeenCalledTimes(1);
 
-      const [traceId, goal, success, options] = mockReportOutcome.mock.calls[0];
+      const [traceId, reportedGoal, success, options] = mockReportOutcome.mock.calls[0];
 
-      // Arg 1: traceId is a UUID
       expect(traceId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-/);
-
-      // Arg 2: goal
-      expect(goal).toBe("my_goal");
-
-      // Arg 3: success
+      expect(reportedGoal).toBe("my_goal");
       expect(success).toBe(true);
 
-      // Arg 4: options
       expect(options.modelId).toBe("claude-sonnet-4-5");
       expect(options.metadata).toMatchObject({
         provider: "anthropic",
@@ -335,10 +496,11 @@ describe("plugin", () => {
       expect(cmd!.description).toBe("Show Kalibr plugin status");
     });
 
-    it("returns status text with config values", () => {
+    it("returns status text with config values including routing", () => {
       const { api, commands } = createMockApi({
         apiKey: "test",
         defaultGoal: "custom_goal",
+        enableRouting: true,
         captureLlmTelemetry: false,
         captureOutcomes: true,
       });
@@ -348,17 +510,18 @@ describe("plugin", () => {
       const result = cmd.handler({});
       expect(result.text).toContain("Kalibr: active");
       expect(result.text).toContain("Goal: custom_goal");
+      expect(result.text).toContain("Routing: on");
       expect(result.text).toContain("Telemetry: off");
       expect(result.text).toContain("Outcomes: on");
     });
 
-    it("uses default goal when not configured", () => {
+    it("shows routing off when not enabled", () => {
       const { api, commands } = createMockApi({ apiKey: "test" });
       plugin.register(api as never);
 
       const cmd = commands.find((c) => c.name === "kalibr")!;
       const result = cmd.handler({});
-      expect(result.text).toContain("Goal: openclaw_agent_run");
+      expect(result.text).toContain("Routing: off");
     });
   });
 
@@ -371,10 +534,11 @@ describe("plugin", () => {
       expect(method).toBeDefined();
     });
 
-    it("responds with status data", () => {
+    it("responds with status data including routing", () => {
       const { api, gatewayMethods } = createMockApi({
         apiKey: "test",
         defaultGoal: "my_goal",
+        enableRouting: true,
         captureLlmTelemetry: true,
         captureOutcomes: false,
       });
@@ -388,9 +552,10 @@ describe("plugin", () => {
         },
       });
 
-      expect(responseData).toEqual({
+      expect(responseData).toMatchObject({
         enabled: true,
         goal: "my_goal",
+        routing: true,
         telemetry: true,
         outcomes: false,
       });

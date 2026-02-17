@@ -1,6 +1,6 @@
 import { randomUUID } from "crypto";
 import { RunStateManager } from "./src/state.js";
-import { openClawToKalibr } from "./src/model-mapper.js";
+import { openClawToKalibr, kalibrToOpenClaw } from "./src/model-mapper.js";
 
 // ── Plugin config shape ────────────────────────────────────
 
@@ -12,17 +12,16 @@ export interface KalibrConfig {
   enabled?: boolean;
   captureOutcomes?: boolean;
   captureLlmTelemetry?: boolean;
+  enableRouting?: boolean;
 }
 
 // ── Minimal OpenClaw plugin SDK types ──────────────────────
-// These mirror the shapes from "openclaw/plugin-sdk" so the plugin
-// can be compiled without depending on the full OpenClaw codebase.
 
 interface PluginLogger {
-  info?(...args: unknown[]): void;
-  warn?(...args: unknown[]): void;
-  error?(...args: unknown[]): void;
-  debug?(...args: unknown[]): void;
+  info(message: string): void;
+  warn(message: string): void;
+  error(message: string): void;
+  debug?(message: string): void;
 }
 
 interface PluginHookAgentContext {
@@ -31,6 +30,18 @@ interface PluginHookAgentContext {
   sessionId?: string;
   workspaceDir?: string;
   messageProvider?: string;
+}
+
+interface PluginHookBeforeAgentStartEvent {
+  prompt: string;
+  messages?: unknown[];
+}
+
+interface PluginHookBeforeAgentStartResult {
+  systemPrompt?: string;
+  prependContext?: string;
+  modelOverride?: string;
+  providerOverride?: string;
 }
 
 interface PluginHookLlmInputEvent {
@@ -88,14 +99,23 @@ interface CliContext {
   };
 }
 
-type HookHandler = (event: unknown, ctx?: PluginHookAgentContext) => void | Promise<void>;
+type VoidHookHandler = (event: unknown, ctx?: PluginHookAgentContext) => void | Promise<void>;
+type BeforeAgentStartHandler = (
+  event: PluginHookBeforeAgentStartEvent,
+  ctx?: PluginHookAgentContext,
+) => PluginHookBeforeAgentStartResult | Promise<PluginHookBeforeAgentStartResult>;
 
 interface OpenClawPluginApi {
   pluginConfig: unknown;
-  logger?: PluginLogger;
+  logger: PluginLogger;
+  on(
+    hookName: "before_agent_start",
+    handler: BeforeAgentStartHandler,
+    opts?: { priority?: number },
+  ): void;
   on(
     hookName: string,
-    handler: HookHandler,
+    handler: VoidHookHandler,
     opts?: { priority?: number },
   ): void;
   registerCommand(opts: {
@@ -114,7 +134,6 @@ interface OpenClawPluginApi {
 }
 
 // ── Kalibr SDK shim types ──────────────────────────────────
-// At runtime these come from @kalibr/sdk; declared here for compilation.
 
 interface KalibrIntelligenceStatic {
   init(opts: { apiKey: string; tenantId?: string; baseUrl?: string }): void;
@@ -142,23 +161,47 @@ type ReportOutcomeFn = (
   options?: ReportOutcomeOptions,
 ) => Promise<OutcomeResponse>;
 
+interface DecideResponse {
+  path_id: string;
+  model_id: string;
+  tool_id?: string;
+  params?: Record<string, unknown>;
+  reason: string;
+  confidence: number;
+  exploration: boolean;
+  success_rate?: number;
+  sample_count?: number;
+}
+
+type DecideFn = (goal: string, options?: { taskRiskLevel?: string }) => Promise<DecideResponse>;
+
 // ── Dynamic imports resolved at runtime ────────────────────
 
 let _kalibrIntelligence: KalibrIntelligenceStatic | undefined;
 let _reportOutcome: ReportOutcomeFn | undefined;
+let _decide: DecideFn | undefined;
 
 async function loadKalibrSdk(): Promise<{
   KalibrIntelligence: KalibrIntelligenceStatic;
   reportOutcome: ReportOutcomeFn;
+  decide: DecideFn;
 }> {
-  if (_kalibrIntelligence && _reportOutcome) {
-    return { KalibrIntelligence: _kalibrIntelligence, reportOutcome: _reportOutcome };
+  if (_kalibrIntelligence && _reportOutcome && _decide) {
+    return {
+      KalibrIntelligence: _kalibrIntelligence,
+      reportOutcome: _reportOutcome,
+      decide: _decide,
+    };
   }
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
   const sdk = await import("@kalibr/sdk");
   _kalibrIntelligence = sdk.KalibrIntelligence;
   _reportOutcome = sdk.reportOutcome;
-  return { KalibrIntelligence: _kalibrIntelligence!, reportOutcome: _reportOutcome! };
+  _decide = sdk.decide;
+  return {
+    KalibrIntelligence: _kalibrIntelligence!,
+    reportOutcome: _reportOutcome!,
+    decide: _decide!,
+  };
 }
 
 // ── Plugin ─────────────────────────────────────────────────
@@ -174,8 +217,8 @@ const plugin = {
 
     const runs = new RunStateManager();
     const goal = cfg.defaultGoal || "openclaw_agent_run";
+    let sdkReady = false;
 
-    // Eagerly attempt SDK init — errors are non-fatal, reported at outcome time
     loadKalibrSdk()
       .then(({ KalibrIntelligence }) => {
         KalibrIntelligence.init({
@@ -183,13 +226,52 @@ const plugin = {
           ...(cfg.tenantId && { tenantId: cfg.tenantId }),
           ...(cfg.apiUrl && { baseUrl: cfg.apiUrl }),
         });
-        api.logger?.info?.("[kalibr] SDK initialized");
+        sdkReady = true;
+        api.logger.info("[kalibr] SDK initialized");
       })
       .catch((err) => {
-        api.logger?.warn?.("[kalibr] SDK init deferred: " + String(err));
+        api.logger.warn("[kalibr] SDK init deferred: " + String(err));
       });
 
-    // ── Hooks (all void — fire-and-forget, parallel) ─────
+    // ── Routing hook (modifying — sequential, merged) ─────
+
+    if (cfg.enableRouting === true) {
+      api.on("before_agent_start", async (
+        _event: PluginHookBeforeAgentStartEvent,
+        _ctx?: PluginHookAgentContext,
+      ): Promise<PluginHookBeforeAgentStartResult> => {
+        if (!sdkReady) return {};
+
+        try {
+          const { decide } = await loadKalibrSdk();
+          const decision = await decide(goal);
+          const mapping = kalibrToOpenClaw(decision.model_id);
+
+          if (!mapping) {
+            api.logger.warn(
+              "[kalibr] decide() returned unknown model_id: " + decision.model_id
+            );
+            return {};
+          }
+
+          api.logger.info(
+            "[kalibr] Routing to " + mapping.provider + "/" + mapping.model
+            + " (confidence: " + decision.confidence
+            + ", exploration: " + decision.exploration + ")"
+          );
+
+          return {
+            modelOverride: mapping.model,
+            providerOverride: mapping.provider,
+          };
+        } catch (err) {
+          api.logger.error("[kalibr] decide() failed, using default model: " + String(err));
+          return {};
+        }
+      });
+    }
+
+    // ── Telemetry hooks (void — fire-and-forget, parallel) ─────
 
     if (cfg.captureLlmTelemetry !== false) {
       api.on("llm_input", async (event: unknown, ctx?: PluginHookAgentContext) => {
@@ -224,7 +306,8 @@ const plugin = {
       });
     }
 
-    // Report outcome after agent run completes
+    // ── Outcome reporting (void — fire-and-forget) ─────
+
     if (cfg.captureOutcomes !== false) {
       api.on("agent_end", async (event: unknown, ctx?: PluginHookAgentContext) => {
         const e = event as PluginHookAgentEndEvent;
@@ -260,7 +343,7 @@ const plugin = {
             },
           );
         } catch (err) {
-          api.logger?.error?.("[kalibr] Outcome report failed: " + String(err));
+          api.logger.error("[kalibr] Outcome report failed: " + String(err));
         }
       });
     }
@@ -270,10 +353,11 @@ const plugin = {
     api.registerCommand({
       name: "kalibr",
       description: "Show Kalibr plugin status",
-      handler: () => ({
+      handler: (_ctx) => ({
         text: [
           "Kalibr: active",
           "Goal: " + goal,
+          "Routing: " + (cfg.enableRouting === true ? "on" : "off"),
           "Telemetry: " + (cfg.captureLlmTelemetry !== false ? "on" : "off"),
           "Outcomes: " + (cfg.captureOutcomes !== false ? "on" : "off"),
         ].join("\n"),
@@ -286,6 +370,8 @@ const plugin = {
       respond(true, {
         enabled: true,
         goal,
+        routing: cfg.enableRouting === true,
+        sdkReady,
         telemetry: cfg.captureLlmTelemetry !== false,
         outcomes: cfg.captureOutcomes !== false,
       });
@@ -298,6 +384,7 @@ const plugin = {
         program.command("kalibr").action(() => {
           console.log("Kalibr: active");
           console.log("Goal: " + goal);
+          console.log("Routing: " + (cfg.enableRouting === true ? "on" : "off"));
           console.log("Telemetry: " + (cfg.captureLlmTelemetry !== false ? "on" : "off"));
           console.log("Outcomes: " + (cfg.captureOutcomes !== false ? "on" : "off"));
         });
@@ -305,7 +392,7 @@ const plugin = {
       { commands: ["kalibr"] },
     );
 
-    api.logger?.info?.("[kalibr] Plugin registered");
+    api.logger.info("[kalibr] Plugin registered");
   },
 };
 
