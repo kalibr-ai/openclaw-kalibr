@@ -1,6 +1,6 @@
 import { randomUUID } from "crypto";
 import { RunStateManager } from "./src/state.js";
-import { openClawToKalibr } from "./src/model-mapper.js";
+import { openClawToKalibr, kalibrToOpenClaw } from "./src/model-mapper.js";
 
 // ── Plugin config shape ────────────────────────────────────
 
@@ -12,6 +12,7 @@ export interface KalibrConfig {
   enabled?: boolean;
   captureOutcomes?: boolean;
   captureLlmTelemetry?: boolean;
+  enableRouting?: boolean;
 }
 
 // ── Minimal OpenClaw plugin SDK types ──────────────────────
@@ -88,7 +89,7 @@ interface CliContext {
   };
 }
 
-type HookHandler = (event: unknown, ctx?: PluginHookAgentContext) => void | Promise<void>;
+type HookHandler = (event: unknown, ctx?: PluginHookAgentContext) => unknown | Promise<unknown>;
 
 interface OpenClawPluginApi {
   pluginConfig: unknown;
@@ -142,10 +143,20 @@ type ReportOutcomeFn = (
   options?: ReportOutcomeOptions,
 ) => Promise<OutcomeResponse>;
 
+interface DecideResponse {
+  model_id: string;
+  confidence: number;
+  exploration: boolean;
+  success_rate: number;
+}
+
+type DecideFn = (goal: string, options?: { taskRiskLevel?: string }) => Promise<DecideResponse>;
+
 // ── Dynamic imports resolved at runtime ────────────────────
 
 let _kalibrIntelligence: KalibrIntelligenceStatic | undefined;
 let _reportOutcome: ReportOutcomeFn | undefined;
+let _decide: DecideFn | undefined;
 
 async function loadKalibrSdk(): Promise<{
   KalibrIntelligence: KalibrIntelligenceStatic;
@@ -159,6 +170,19 @@ async function loadKalibrSdk(): Promise<{
   _kalibrIntelligence = sdk.KalibrIntelligence;
   _reportOutcome = sdk.reportOutcome;
   return { KalibrIntelligence: _kalibrIntelligence!, reportOutcome: _reportOutcome! };
+}
+
+// ── Provider inference ─────────────────────────────────────
+
+function inferProvider(modelId: string): string | null {
+  if (modelId.startsWith("claude")) return "anthropic";
+  if (modelId.startsWith("gpt")) return "openai";
+  if (modelId.startsWith("gemini")) return "google";
+  if (modelId.startsWith("mistral") || modelId.startsWith("codestral")) return "mistral";
+  if (modelId.startsWith("llama")) return "meta";
+  if (modelId.startsWith("command")) return "cohere";
+  if (modelId.startsWith("deepseek")) return "deepseek";
+  return null;
 }
 
 // ── Plugin ─────────────────────────────────────────────────
@@ -189,7 +213,36 @@ const plugin = {
         api.logger?.warn?.("[kalibr] SDK init deferred: " + String(err));
       });
 
-    // ── Hooks (all void — fire-and-forget, parallel) ─────
+    // ── Routing hook (sequential, returns overrides) ─────
+
+    if (cfg.enableRouting) {
+      api.on("before_agent_start", async (_event: unknown) => {
+        try {
+          if (!_decide) {
+            const sdk = await import("@kalibr/sdk");
+            _decide = sdk.decide as DecideFn;
+          }
+          const response = await _decide(goal);
+          const openClawRef = kalibrToOpenClaw(response.model_id);
+          if (openClawRef) {
+            const [provider] = openClawRef.split("/");
+            return { modelOverride: openClawRef, providerOverride: provider };
+          }
+          const provider = inferProvider(response.model_id);
+          if (provider) {
+            return {
+              modelOverride: `${provider}/${response.model_id}`,
+              providerOverride: provider,
+            };
+          }
+          return {};
+        } catch {
+          return {};
+        }
+      });
+    }
+
+    // ── Hooks (fire-and-forget, parallel) ──────────────
 
     if (cfg.captureLlmTelemetry !== false) {
       api.on("llm_input", async (event: unknown, ctx?: PluginHookAgentContext) => {
@@ -274,6 +327,7 @@ const plugin = {
         text: [
           "Kalibr: active",
           "Goal: " + goal,
+          "Routing: " + (cfg.enableRouting ? "on" : "off"),
           "Telemetry: " + (cfg.captureLlmTelemetry !== false ? "on" : "off"),
           "Outcomes: " + (cfg.captureOutcomes !== false ? "on" : "off"),
         ].join("\n"),
@@ -298,6 +352,7 @@ const plugin = {
         program.command("kalibr").action(() => {
           console.log("Kalibr: active");
           console.log("Goal: " + goal);
+          console.log("Routing: " + (cfg.enableRouting ? "on" : "off"));
           console.log("Telemetry: " + (cfg.captureLlmTelemetry !== false ? "on" : "off"));
           console.log("Outcomes: " + (cfg.captureOutcomes !== false ? "on" : "off"));
         });
