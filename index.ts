@@ -78,6 +78,23 @@ interface PluginHookAgentEndEvent {
   durationMs?: number;
 }
 
+interface PluginHookBeforeToolCallEvent {
+  toolName: string;
+  params: Record<string, unknown>;
+}
+
+interface PluginHookToolContext {
+  agentId?: string;
+  sessionKey?: string;
+  toolName: string;
+}
+
+interface PluginHookBeforeToolCallResult {
+  params?: Record<string, unknown>;
+  block?: boolean;
+  blockReason?: string;
+}
+
 interface CommandHandlerResult {
   text: string;
 }
@@ -104,6 +121,10 @@ type BeforeAgentStartHandler = (
   event: PluginHookBeforeAgentStartEvent,
   ctx?: PluginHookAgentContext,
 ) => PluginHookBeforeAgentStartResult | Promise<PluginHookBeforeAgentStartResult>;
+type BeforeToolCallHandler = (
+  event: PluginHookBeforeToolCallEvent,
+  ctx?: PluginHookToolContext,
+) => PluginHookBeforeToolCallResult | Promise<PluginHookBeforeToolCallResult>;
 
 interface OpenClawPluginApi {
   pluginConfig: unknown;
@@ -111,6 +132,11 @@ interface OpenClawPluginApi {
   on(
     hookName: "before_agent_start",
     handler: BeforeAgentStartHandler,
+    opts?: { priority?: number },
+  ): void;
+  on(
+    hookName: "before_tool_call",
+    handler: BeforeToolCallHandler,
     opts?: { priority?: number },
   ): void;
   on(
@@ -237,14 +263,23 @@ const plugin = {
 
     if (cfg.enableRouting === true) {
       api.on("before_agent_start", async (
-        _event: PluginHookBeforeAgentStartEvent,
-        _ctx?: PluginHookAgentContext,
+        event: PluginHookBeforeAgentStartEvent,
+        ctx?: PluginHookAgentContext,
       ): Promise<PluginHookBeforeAgentStartResult> => {
         if (!sdkReady) return {};
 
         try {
           const { decide } = await loadKalibrSdk();
           const decision = await decide(goal);
+
+          const sessionKey = ctx?.sessionKey;
+          if (sessionKey) {
+            runs.setLastDecision(sessionKey, {
+              tool_id: decision.tool_id,
+              params: decision.params,
+            });
+          }
+
           const mapping = kalibrToOpenClaw(decision.model_id);
 
           if (!mapping) {
@@ -266,6 +301,46 @@ const plugin = {
           };
         } catch (err) {
           api.logger.error("[kalibr] decide() failed, using default model: " + String(err));
+          return {};
+        }
+      });
+    }
+
+    // ── Tool call hook (modifying — param injection + telemetry) ─────
+
+    if (cfg.enableRouting === true || cfg.captureLlmTelemetry !== false) {
+      api.on("before_tool_call", async (
+        event: PluginHookBeforeToolCallEvent,
+        ctx?: PluginHookToolContext,
+      ): Promise<PluginHookBeforeToolCallResult> => {
+        try {
+          const sessionKey = ctx?.sessionKey;
+          if (!sessionKey) return {};
+
+          runs.recordToolCall(sessionKey, event.toolName);
+
+          if (cfg.enableRouting !== true) return {};
+
+          const decision = runs.getLastDecision(sessionKey);
+          if (!decision || !decision.params || Object.keys(decision.params).length === 0) {
+            return {};
+          }
+
+          if (decision.tool_id && decision.tool_id !== event.toolName) {
+            api.logger.info(
+              "[kalibr] Decision tool_id (" + decision.tool_id
+              + ") differs from current tool (" + event.toolName + "), proceeding anyway"
+            );
+          }
+
+          api.logger.info(
+            "[kalibr] Injecting params for tool " + event.toolName + ": "
+            + JSON.stringify(decision.params)
+          );
+
+          const merged = { ...event.params, ...decision.params };
+          return { params: merged };
+        } catch {
           return {};
         }
       });
@@ -327,6 +402,9 @@ const plugin = {
               modelId: runData.primaryModel
                 ? openClawToKalibr(runData.primaryModel)
                 : undefined,
+              toolId: runData.toolsCalled.length > 0
+                ? runData.toolsCalled[0]
+                : undefined,
               metadata: {
                 provider: runData.primaryProvider,
                 agentId: ctx?.agentId,
@@ -338,6 +416,8 @@ const plugin = {
                 totalTokens: runData.totalTokens,
                 cacheReadTokens: runData.totalCacheReadTokens,
                 cacheWriteTokens: runData.totalCacheWriteTokens,
+                toolsCalled: runData.toolsCalled,
+                toolCallCount: runData.toolsCalled.length,
               },
               ...(e.error && { failureReason: e.error }),
             },
@@ -358,6 +438,7 @@ const plugin = {
           "Kalibr: active",
           "Goal: " + goal,
           "Routing: " + (cfg.enableRouting === true ? "on" : "off"),
+          "Param injection: " + (cfg.enableRouting === true ? "on" : "off"),
           "Telemetry: " + (cfg.captureLlmTelemetry !== false ? "on" : "off"),
           "Outcomes: " + (cfg.captureOutcomes !== false ? "on" : "off"),
         ].join("\n"),
@@ -371,6 +452,7 @@ const plugin = {
         enabled: true,
         goal,
         routing: cfg.enableRouting === true,
+        paramInjection: cfg.enableRouting === true,
         sdkReady,
         telemetry: cfg.captureLlmTelemetry !== false,
         outcomes: cfg.captureOutcomes !== false,
@@ -385,6 +467,7 @@ const plugin = {
           console.log("Kalibr: active");
           console.log("Goal: " + goal);
           console.log("Routing: " + (cfg.enableRouting === true ? "on" : "off"));
+          console.log("Param injection: " + (cfg.enableRouting === true ? "on" : "off"));
           console.log("Telemetry: " + (cfg.captureLlmTelemetry !== false ? "on" : "off"));
           console.log("Outcomes: " + (cfg.captureOutcomes !== false ? "on" : "off"));
         });

@@ -80,6 +80,14 @@ Before each agent run:
 
 If anything fails — SDK not initialized, `decide()` throws, unknown model — the plugin returns `{}` and OpenClaw uses its default model.
 
+### Parameter Injection (v0.2)
+
+When `enableRouting` is `true`, the plugin also registers a `before_tool_call` hook. Kalibr's `decide()` response can include a `params` object alongside `model_id`. If present, these parameters are merged into tool call arguments — decision params take precedence over the tool's existing params on conflict.
+
+Tool names are captured for telemetry regardless of whether routing is enabled. Every `before_tool_call` invocation records the tool name, which is included in the `reportOutcome()` metadata as `toolsCalled` and `toolCallCount`. The first tool called in a session is also sent as `toolId`.
+
+The `before_tool_call` hook **cannot** redirect tool calls to different tools — only OpenClaw's `before_agent_start` can override the model. If the decision's `tool_id` differs from the current tool, the plugin logs an informational message and proceeds with parameter injection.
+
 ## Verification
 ```bash
 openclaw plugins list
@@ -90,8 +98,9 @@ openclaw kalibr        # CLI status
 
 ## Roadmap
 
-- **v0.1** — Telemetry + Routing (current)
-- **v0.2** — Exploration tuning, multi-goal policies, per-task routing, cost constraints
+- **v0.1** — Telemetry + Routing
+- **v0.2** — Parameter injection via `before_tool_call`, tool telemetry (current)
+- **v0.3** — Exploration tuning, multi-goal policies, per-task routing, cost constraints
 
 ## Links
 

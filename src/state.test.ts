@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { RunStateManager } from "./state.js";
 import type { LlmInputRecord, LlmOutputRecord } from "./state.js";
 
@@ -167,6 +167,109 @@ describe("RunStateManager", () => {
       manager.recordLlmInput("new-session", makeInput());
       expect(manager.size).toBe(1); // old evicted, new added
       expect(manager.getAndClear("old-session")).toBeNull();
+    });
+  });
+
+  describe("setLastDecision / getLastDecision", () => {
+    it("round-trips a stored decision", () => {
+      manager.setLastDecision("session-1", {
+        tool_id: "tool-abc",
+        params: { temperature: 0.5 },
+      });
+
+      const decision = manager.getLastDecision("session-1");
+      expect(decision).toEqual({
+        tool_id: "tool-abc",
+        params: { temperature: 0.5 },
+      });
+    });
+
+    it("returns null for unknown session", () => {
+      expect(manager.getLastDecision("nonexistent")).toBeNull();
+    });
+
+    it("getAndClear also clears lastDecision", () => {
+      manager.recordLlmInput("session-1", makeInput());
+      manager.setLastDecision("session-1", {
+        tool_id: "tool-1",
+        params: { key: "value" },
+      });
+
+      manager.getAndClear("session-1");
+      expect(manager.getLastDecision("session-1")).toBeNull();
+    });
+
+    it("evicts stale lastDecisions past TTL", () => {
+      vi.useFakeTimers();
+
+      const now = Date.now();
+      manager.setLastDecision("stale-session", {
+        tool_id: "tool-old",
+        params: { old: true },
+      });
+
+      // Advance time past TTL (10 min + 1 min)
+      vi.advanceTimersByTime(11 * 60 * 1000);
+
+      // Trigger eviction via recordLlmInput which calls evictStale
+      manager.recordLlmInput("new-session", makeInput({ timestamp: now + 11 * 60 * 1000 }));
+
+      expect(manager.getLastDecision("stale-session")).toBeNull();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+  });
+
+  describe("recordToolCall", () => {
+    it("adds tool names to the run state", () => {
+      manager.recordLlmInput("session-1", makeInput());
+      manager.recordToolCall("session-1", "Read");
+      manager.recordToolCall("session-1", "Write");
+
+      const data = manager.getAndClear("session-1");
+      expect(data!.toolsCalled).toEqual(["Read", "Write"]);
+    });
+
+    it("creates run entry if none exists", () => {
+      manager.recordToolCall("session-new", "Bash");
+      expect(manager.size).toBe(1);
+
+      const data = manager.getAndClear("session-new");
+      expect(data).not.toBeNull();
+      expect(data!.toolsCalled).toEqual(["Bash"]);
+      expect(data!.inputs).toEqual([]);
+      expect(data!.outputs).toEqual([]);
+    });
+
+    it("calls evictStale (evicts old runs)", () => {
+      manager.recordLlmInput("old-session", makeInput({
+        timestamp: Date.now() - 11 * 60 * 1000,
+      }));
+      expect(manager.size).toBe(1);
+
+      manager.recordToolCall("new-session", "Read");
+      expect(manager.size).toBe(1); // old evicted, new added
+      expect(manager.getAndClear("old-session")).toBeNull();
+    });
+  });
+
+  describe("getAndClear returns toolsCalled", () => {
+    it("includes toolsCalled in aggregated data", () => {
+      manager.recordLlmInput("session-1", makeInput());
+      manager.recordToolCall("session-1", "Read");
+      manager.recordToolCall("session-1", "Edit");
+      manager.recordToolCall("session-1", "Bash");
+
+      const data = manager.getAndClear("session-1");
+      expect(data!.toolsCalled).toEqual(["Read", "Edit", "Bash"]);
+    });
+
+    it("returns empty toolsCalled when no tools were called", () => {
+      manager.recordLlmInput("session-1", makeInput());
+      const data = manager.getAndClear("session-1");
+      expect(data!.toolsCalled).toEqual([]);
     });
   });
 });
