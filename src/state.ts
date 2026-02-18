@@ -1,5 +1,10 @@
 import { randomUUID } from "crypto";
 
+export interface StoredDecision {
+  tool_id?: string;
+  params?: Record<string, unknown>;
+}
+
 export interface LlmInputRecord {
   runId: string;
   provider: string;
@@ -23,6 +28,7 @@ interface RunState {
   traceId: string;
   inputs: LlmInputRecord[];
   outputs: LlmOutputRecord[];
+  toolsCalled: string[];
 }
 
 export interface AggregatedRunData {
@@ -37,10 +43,12 @@ export interface AggregatedRunData {
   totalCacheWriteTokens: number;
   inputs: LlmInputRecord[];
   outputs: LlmOutputRecord[];
+  toolsCalled: string[];
 }
 
 export class RunStateManager {
   private runs = new Map<string, RunState>();
+  private lastDecisions = new Map<string, { decision: StoredDecision; storedAt: number }>();
   private readonly TTL_MS = 10 * 60 * 1000; // 10 min TTL for orphaned runs
 
   private evictStale(): void {
@@ -56,6 +64,11 @@ export class RunStateManager {
         this.runs.delete(key);
       }
     }
+    for (const [key, entry] of this.lastDecisions) {
+      if (now - entry.storedAt > this.TTL_MS) {
+        this.lastDecisions.delete(key);
+      }
+    }
   }
 
   recordLlmInput(sessionKey: string, record: LlmInputRecord): void {
@@ -65,6 +78,7 @@ export class RunStateManager {
         traceId: randomUUID(),
         inputs: [],
         outputs: [],
+        toolsCalled: [],
       });
     }
     this.runs.get(sessionKey)!.inputs.push(record);
@@ -76,15 +90,43 @@ export class RunStateManager {
         traceId: randomUUID(),
         inputs: [],
         outputs: [],
+        toolsCalled: [],
       });
     }
     this.runs.get(sessionKey)!.outputs.push(record);
+  }
+
+  setLastDecision(sessionKey: string, decision: StoredDecision): void {
+    this.lastDecisions.set(sessionKey, {
+      decision,
+      storedAt: Date.now(),
+    });
+  }
+
+  getLastDecision(sessionKey: string): StoredDecision | null {
+    const entry = this.lastDecisions.get(sessionKey);
+    if (!entry) return null;
+    return entry.decision;
+  }
+
+  recordToolCall(sessionKey: string, toolName: string): void {
+    this.evictStale();
+    if (!this.runs.has(sessionKey)) {
+      this.runs.set(sessionKey, {
+        traceId: randomUUID(),
+        inputs: [],
+        outputs: [],
+        toolsCalled: [],
+      });
+    }
+    this.runs.get(sessionKey)!.toolsCalled.push(toolName);
   }
 
   getAndClear(sessionKey: string): AggregatedRunData | null {
     const run = this.runs.get(sessionKey);
     if (!run) return null;
     this.runs.delete(sessionKey);
+    this.lastDecisions.delete(sessionKey);
 
     const firstInput = run.inputs[0];
     const outputs = run.outputs;
@@ -101,6 +143,7 @@ export class RunStateManager {
       totalCacheWriteTokens: outputs.reduce((s, o) => s + o.cacheWriteTokens, 0),
       inputs: run.inputs,
       outputs,
+      toolsCalled: run.toolsCalled,
     };
   }
 

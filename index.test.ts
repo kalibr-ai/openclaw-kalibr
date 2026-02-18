@@ -302,6 +302,373 @@ describe("plugin", () => {
     });
   });
 
+  describe("before_tool_call hook registration", () => {
+    it("registers before_tool_call when enableRouting is true", () => {
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+      });
+      plugin.register(api as never);
+
+      const hookNames = hooks.map((h) => h.name);
+      expect(hookNames).toContain("before_tool_call");
+    });
+
+    it("registers before_tool_call when enableRouting is false but captureLlmTelemetry is true", () => {
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: false,
+        captureLlmTelemetry: true,
+      });
+      plugin.register(api as never);
+
+      const hookNames = hooks.map((h) => h.name);
+      expect(hookNames).toContain("before_tool_call");
+    });
+
+    it("does NOT register before_tool_call when both enableRouting is false and captureLlmTelemetry is false", () => {
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: false,
+        captureLlmTelemetry: false,
+      });
+      plugin.register(api as never);
+
+      const hookNames = hooks.map((h) => h.name);
+      expect(hookNames).not.toContain("before_tool_call");
+    });
+
+    it("registers only ONE before_tool_call hook when both enableRouting and captureLlmTelemetry are true", () => {
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+        captureLlmTelemetry: true,
+      });
+      plugin.register(api as never);
+
+      const toolCallHooks = hooks.filter((h) => h.name === "before_tool_call");
+      expect(toolCallHooks).toHaveLength(1);
+    });
+  });
+
+  describe("before_tool_call hook behavior", () => {
+    it("returns {} when no decision stored but still records tool name", async () => {
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+      });
+      plugin.register(api as never);
+
+      const handler = findHook(hooks, "before_tool_call")!.handler;
+      const result = await handler(
+        { toolName: "Read", params: { file_path: "/foo" } },
+        { sessionKey: "sk-1", toolName: "Read" },
+      );
+
+      expect(result).toEqual({});
+    });
+
+    it("returns {} when decision has no params", async () => {
+      const sdk = await import("@kalibr/sdk");
+      const mockDecide = sdk.decide as ReturnType<typeof vi.fn>;
+      mockDecide.mockClear();
+      mockDecide.mockResolvedValueOnce({
+        path_id: "path-1",
+        model_id: "claude-sonnet-4-5",
+        reason: "best",
+        confidence: 0.9,
+        exploration: false,
+      });
+
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+      });
+      plugin.register(api as never);
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Trigger before_agent_start to store decision (no params)
+      const agentStartHandler = findHook(hooks, "before_agent_start")!.handler;
+      await agentStartHandler(
+        { prompt: "hello" },
+        { sessionKey: "sk-1" },
+      );
+
+      const handler = findHook(hooks, "before_tool_call")!.handler;
+      const result = await handler(
+        { toolName: "Read", params: { file_path: "/foo" } },
+        { sessionKey: "sk-1", toolName: "Read" },
+      );
+
+      expect(result).toEqual({});
+    });
+
+    it("returns { params } with merged params when decision has params (decision wins on conflicts)", async () => {
+      const sdk = await import("@kalibr/sdk");
+      const mockDecide = sdk.decide as ReturnType<typeof vi.fn>;
+      mockDecide.mockClear();
+      mockDecide.mockResolvedValueOnce({
+        path_id: "path-1",
+        model_id: "claude-sonnet-4-5",
+        tool_id: "Read",
+        params: { temperature: 0.5, max_tokens: 1000 },
+        reason: "best",
+        confidence: 0.9,
+        exploration: false,
+      });
+
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+      });
+      plugin.register(api as never);
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Trigger before_agent_start to store decision with params
+      const agentStartHandler = findHook(hooks, "before_agent_start")!.handler;
+      await agentStartHandler(
+        { prompt: "hello" },
+        { sessionKey: "sk-1" },
+      );
+
+      const handler = findHook(hooks, "before_tool_call")!.handler;
+      const result = await handler(
+        { toolName: "Read", params: { file_path: "/foo", temperature: 0.8 } },
+        { sessionKey: "sk-1", toolName: "Read" },
+      );
+
+      // decision.params wins on conflict (temperature)
+      expect(result).toEqual({
+        params: { file_path: "/foo", temperature: 0.5, max_tokens: 1000 },
+      });
+    });
+
+    it("in telemetry-only mode returns {} and still records tool name", async () => {
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: false,
+        captureLlmTelemetry: true,
+      });
+      plugin.register(api as never);
+
+      const handler = findHook(hooks, "before_tool_call")!.handler;
+      const result = await handler(
+        { toolName: "Bash", params: { command: "ls" } },
+        { sessionKey: "sk-1", toolName: "Bash" },
+      );
+
+      expect(result).toEqual({});
+    });
+
+    it("returns {} when sessionKey is missing", async () => {
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+      });
+      plugin.register(api as never);
+
+      const handler = findHook(hooks, "before_tool_call")!.handler;
+      const result = await handler(
+        { toolName: "Read", params: {} },
+        { toolName: "Read" }, // no sessionKey
+      );
+
+      expect(result).toEqual({});
+    });
+
+    it("returns {} on error (graceful degradation)", async () => {
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+      });
+      plugin.register(api as never);
+
+      const handler = findHook(hooks, "before_tool_call")!.handler;
+      // Pass null ctx to force an error path
+      const result = await handler(
+        { toolName: "Read", params: {} },
+        undefined,
+      );
+
+      expect(result).toEqual({});
+    });
+  });
+
+  describe("integration: before_agent_start stores decision, before_tool_call reads it", () => {
+    it("injects params from decide() into tool calls", async () => {
+      const sdk = await import("@kalibr/sdk");
+      const mockDecide = sdk.decide as ReturnType<typeof vi.fn>;
+      mockDecide.mockClear();
+      mockDecide.mockResolvedValueOnce({
+        path_id: "path-1",
+        model_id: "claude-sonnet-4-5",
+        tool_id: "Write",
+        params: { encoding: "utf-8", overwrite: true },
+        reason: "optimized",
+        confidence: 0.95,
+        exploration: false,
+      });
+
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+      });
+      plugin.register(api as never);
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Step 1: before_agent_start stores decision
+      const agentStartHandler = findHook(hooks, "before_agent_start")!.handler;
+      await agentStartHandler(
+        { prompt: "write a file" },
+        { sessionKey: "sk-integration" },
+      );
+
+      // Step 2: before_tool_call reads and injects params
+      const toolCallHandler = findHook(hooks, "before_tool_call")!.handler;
+      const result = await toolCallHandler(
+        { toolName: "Write", params: { file_path: "/test.txt", content: "hello" } },
+        { sessionKey: "sk-integration", toolName: "Write" },
+      );
+
+      expect(result).toEqual({
+        params: {
+          file_path: "/test.txt",
+          content: "hello",
+          encoding: "utf-8",
+          overwrite: true,
+        },
+      });
+    });
+  });
+
+  describe("tool telemetry in outcome reporting", () => {
+    it("includes toolsCalled and toolCallCount in outcome metadata", async () => {
+      const sdk = await import("@kalibr/sdk");
+      const mockReportOutcome = sdk.reportOutcome as ReturnType<typeof vi.fn>;
+      mockReportOutcome.mockClear();
+
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+        defaultGoal: "my_goal",
+      });
+      plugin.register(api as never);
+      await new Promise((r) => setTimeout(r, 50));
+
+      const inputHandler = findHook(hooks, "llm_input")!.handler;
+      const toolCallHandler = findHook(hooks, "before_tool_call")!.handler;
+      const endHandler = findHook(hooks, "agent_end")!.handler;
+
+      const ctx = { sessionKey: "sk-tools", agentId: "agent-1" };
+
+      await inputHandler(
+        { runId: "r1", sessionId: "s1", provider: "anthropic", model: "anthropic/claude-sonnet-4-5", prompt: "p", historyMessages: [], imagesCount: 0 },
+        ctx,
+      );
+
+      // Record tool calls
+      await toolCallHandler(
+        { toolName: "Read", params: {} },
+        { sessionKey: "sk-tools", toolName: "Read" },
+      );
+      await toolCallHandler(
+        { toolName: "Edit", params: {} },
+        { sessionKey: "sk-tools", toolName: "Edit" },
+      );
+
+      await endHandler(
+        { messages: [], success: true, durationMs: 500 },
+        ctx,
+      );
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(mockReportOutcome).toHaveBeenCalledTimes(1);
+      const [, , , options] = mockReportOutcome.mock.calls[0];
+      expect(options.toolId).toBe("Read"); // first tool called
+      expect(options.metadata.toolsCalled).toEqual(["Read", "Edit"]);
+      expect(options.metadata.toolCallCount).toBe(2);
+    });
+
+    it("does not include toolId when no tools were called", async () => {
+      const sdk = await import("@kalibr/sdk");
+      const mockReportOutcome = sdk.reportOutcome as ReturnType<typeof vi.fn>;
+      mockReportOutcome.mockClear();
+
+      const { api, hooks } = createMockApi({
+        apiKey: "test",
+        defaultGoal: "my_goal",
+      });
+      plugin.register(api as never);
+
+      const inputHandler = findHook(hooks, "llm_input")!.handler;
+      const endHandler = findHook(hooks, "agent_end")!.handler;
+      const ctx = { sessionKey: "sk-no-tools" };
+
+      await inputHandler(
+        { runId: "r1", sessionId: "s1", provider: "anthropic", model: "anthropic/claude-sonnet-4-5", prompt: "p", historyMessages: [], imagesCount: 0 },
+        ctx,
+      );
+
+      await endHandler(
+        { messages: [], success: true },
+        ctx,
+      );
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(mockReportOutcome).toHaveBeenCalledTimes(1);
+      const [, , , options] = mockReportOutcome.mock.calls[0];
+      expect(options.toolId).toBeUndefined();
+      expect(options.metadata.toolsCalled).toEqual([]);
+      expect(options.metadata.toolCallCount).toBe(0);
+    });
+  });
+
+  describe("status outputs include param injection", () => {
+    it("slash command shows param injection on when routing enabled", () => {
+      const { api, commands } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+      });
+      plugin.register(api as never);
+
+      const cmd = commands.find((c) => c.name === "kalibr")!;
+      const result = cmd.handler({});
+      expect(result.text).toContain("Param injection: on");
+    });
+
+    it("slash command shows param injection off when routing disabled", () => {
+      const { api, commands } = createMockApi({
+        apiKey: "test",
+        enableRouting: false,
+      });
+      plugin.register(api as never);
+
+      const cmd = commands.find((c) => c.name === "kalibr")!;
+      const result = cmd.handler({});
+      expect(result.text).toContain("Param injection: off");
+    });
+
+    it("gateway status includes paramInjection field", () => {
+      const { api, gatewayMethods } = createMockApi({
+        apiKey: "test",
+        enableRouting: true,
+      });
+      plugin.register(api as never);
+
+      const method = gatewayMethods.find((m) => m.name === "kalibr.status")!;
+      let responseData: Record<string, unknown> = {};
+      method.handler({
+        respond: (_success: boolean, data: unknown) => {
+          responseData = data as Record<string, unknown>;
+        },
+      });
+
+      expect(responseData.paramInjection).toBe(true);
+    });
+  });
+
   describe("llm_input hook", () => {
     it("ignores events without sessionKey in context", async () => {
       const { api, hooks } = createMockApi({ apiKey: "test" });
