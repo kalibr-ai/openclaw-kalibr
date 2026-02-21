@@ -1,14 +1,14 @@
 # @kalibr/openclaw
 
-Autonomous execution path routing for [OpenClaw](https://docs.openclaw.ai) agents. Reads real-time telemetry and routes to the optimal model + tool + parameter combination — preventing failures, degradations, and cost spikes before they impact users.
+Ship agents that fix themselves. This plugin connects [OpenClaw](https://docs.openclaw.ai) to [Kalibr](https://kalibr.systems) — so your agents learn what's working in production and route around failures, degradations, and cost spikes before they impact users.
 
 ## How It Works
 
-This plugin creates a closed feedback loop between OpenClaw and [Kalibr](https://kalibr.systems):
+This plugin creates a closed feedback loop between OpenClaw and Kalibr:
 
 **Observe** — Hooks into every LLM call (`llm_input`/`llm_output`) and agent run completion (`agent_end`). Captures which model was used, token counts, and whether the run succeeded or failed. Reports this telemetry to Kalibr via `reportOutcome()`.
 
-**Route** — Before each agent run, calls Kalibr's `decide()` API. Kalibr uses Thompson Sampling over historical outcomes to recommend the optimal execution path (model + tool + parameters). The plugin returns `modelOverride`/`providerOverride` to OpenClaw, which applies it to the run. 90% of traffic goes to the best-performing path. 10% explores alternatives to detect changes.
+**Route** — Before each agent run, calls Kalibr's `decide()` API. Kalibr uses Thompson Sampling over historical outcomes to pick the best execution path (model + tool + parameters). The plugin returns `modelOverride`/`providerOverride` to OpenClaw, which applies it to the run. 90% of traffic goes to the best-performing path. 10% explores alternatives to detect changes.
 
 **Adapt** — As outcomes flow in, Kalibr's routing policy updates automatically. If a model degrades — provider outage, quality regression, rate limits — Kalibr detects the drop in success rate and routes around it before users notice.
 
@@ -16,7 +16,7 @@ OpenClaw's `modelOverride` gives you a steering wheel. Kalibr gives you a driver
 
 ## What You Get
 
-- **Autonomous execution path selection** based on real outcome data, not guesswork
+- **Agents that fix themselves** — Kalibr learns from real outcomes and reroutes automatically
 - **Graceful degradation** — if Kalibr is unreachable, OpenClaw uses its default model. Agent runs are never blocked.
 - **Zero-config telemetry** — token usage, success/failure, and duration captured automatically from hooks
 - **Provider inference** — works with Anthropic, OpenAI, Google, Mistral, Meta, Cohere, and DeepSeek models out of the box
@@ -52,7 +52,7 @@ Kalibr immediately starts learning from your agent runs.
 }
 ```
 
-Now Kalibr selects the optimal execution path for each agent run based on historical performance.
+Now Kalibr picks the best execution path for each agent run based on what's actually working.
 
 ## Configuration
 
