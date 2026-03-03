@@ -1,6 +1,6 @@
 {
   "name": "@kalibr/openclaw",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Kalibr routing intelligence plugin for OpenClaw",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
