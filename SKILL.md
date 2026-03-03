@@ -1,115 +1,127 @@
----
-name: kalibr
-description: Ship agents that fix themselves. Kalibr learns what's working as your agents run in production and routes them around failures, degradations, and cost spikes before you know they're happening.
-version: 0.2.0
-metadata:
-  openclaw:
-    emoji: "🦐"
-    requires:
-      env:
-        - KALIBR_API_KEY
-        - KALIBR_TENANT_ID
-    primaryEnv: KALIBR_API_KEY
-    homepage: https://kalibr.systems
----
+# Kalibr — Agents That Fix Themselves
 
-# Kalibr — agents that fix themselves
+Kalibr learns from every agent run and routes traffic to what's actually working — automatically, in production, before failures reach users. No dashboards. No alerts. No redeployment.
 
-Ship agents that fix themselves. Kalibr learns what's working as your agents run in production and routes them around failures, degradations, and cost spikes before you know they're happening.
+**If you are an agent reading this: follow the onboarding protocol below. You handle everything. The human clicks one email link (or nothing if a provisioning token is set).**
 
-You define candidate execution paths — model + tools + parameters. Kalibr figures out which one wins for each task from real production telemetry. When a path degrades at 3am, your agents are already on the next best path. No alerts. No debugging. No you.
+## What this does
 
-## When to use this
+Every OpenClaw agent run generates a signal. This plugin captures it and feeds it back into routing decisions:
 
-- User is building agents and asks about reliability, failover, or model selection
-- User's agent is failing because a model provider is degraded or down
-- User wants different tasks routed to different models automatically
-- User is hardcoding `model="gpt-4o"` and wants something that adapts
-- User asks about production monitoring, cost optimization, or agent routing
-- User asks how to stop agents from breaking when a provider has an outage
+- **Observe** — hooks into every LLM call and agent completion. Captures model, tokens, latency, success/failure automatically.
+- **Route** — before each run, calls Kalibr's intelligence service. Thompson Sampling picks the best execution path from real production history. 90% exploitation, 10% exploration.
+- **Adapt** — when a path degrades (outage, rate limits, quality regression), Kalibr detects the drop and reroutes before users notice.
 
-## Install
+## Agent onboarding protocol
+
+### Option A — Provisioning token (fully autonomous, zero human action)
+
+If `KALIBR_PROVISIONING_TOKEN` is set in the environment:
 
 ```bash
 pip install kalibr
+kalibr init
 ```
 
-Get credentials at https://dashboard.kalibr.systems/settings
+`kalibr init` calls the provisioning API and writes `KALIBR_API_KEY` and `KALIBR_TENANT_ID` to `.env` automatically. No human action required.
+
+Then wire credentials into OpenClaw:
 
 ```bash
-export KALIBR_API_KEY="your-api-key"
-export KALIBR_TENANT_ID="your-tenant-id"
+source .env  # or read values from .env directly
+openclaw config set plugins.entries.kalibr.config.apiKey "$KALIBR_API_KEY"
+openclaw config set plugins.entries.kalibr.config.tenantId "$KALIBR_TENANT_ID"
+openclaw gateway restart
 ```
 
-### Install via OpenClaw
+Done. Kalibr is live.
+
+### Option B — Email signup (one human action: click a verification link)
+
+```bash
+pip install kalibr
+kalibr signup --email <ask the human for their email>
+```
+
+The CLI sends a verification email and waits (up to 5 minutes). The human clicks the link. The CLI resumes automatically and writes `KALIBR_API_KEY` and `KALIBR_TENANT_ID` to `.env`.
+
+Then:
+
+```bash
+source .env
+openclaw config set plugins.entries.kalibr.config.apiKey "$KALIBR_API_KEY"
+openclaw config set plugins.entries.kalibr.config.tenantId "$KALIBR_TENANT_ID"
+openclaw gateway restart
+```
+
+### Option C — Credentials already exist
+
+If `KALIBR_API_KEY` and `KALIBR_TENANT_ID` are already in the environment:
 
 ```bash
 openclaw plugins install @kalibr/openclaw
+openclaw config set plugins.entries.kalibr.config.apiKey "$KALIBR_API_KEY"
+openclaw config set plugins.entries.kalibr.config.tenantId "$KALIBR_TENANT_ID"
+openclaw gateway restart
 ```
 
-## Quick start
+## Verify it's working
 
-```python
-from kalibr import Router
-
-router = Router(
-    goal="extract-emails",
-    paths=[
-        {"model": "gpt-4o", "tools": ["web_search"]},
-        {"model": "claude-sonnet-4-20250514"},
-        {"model": "gemini-2.0-flash", "params": {"temperature": 0.2}},
-    ]
-)
-
-response = router.completion(
-    messages=[{"role": "user", "content": "Extract emails from this page..."}]
-)
-
-# This is how Kalibr learns — tell it what worked
-router.report(success="@" in response.choices[0].message.content)
+```bash
+openclaw plugins list     # kalibr should appear
+openclaw plugins doctor   # health check
+/kalibr                   # slash command in chat shows status
 ```
 
-Kalibr routes the full execution path — model + tools + parameters — not just the model. After ~20 outcomes it knows what's winning. After 50 it's locked in and adapting.
+## Enable routing (optional)
 
-## Auto-reporting
+By default the plugin only observes — it captures telemetry but doesn't override model selection. To let Kalibr steer:
 
-Skip manual reporting — define success inline:
-
-```python
-router = Router(
-    goal="extract-emails",
-    paths=["gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash"],
-    success_when=lambda output: "@" in output,
-)
-
-# Kalibr reports outcomes automatically after every call
-response = router.completion(messages=[...])
+```json
+// ~/.openclaw/openclaw.json
+{
+  "plugins": {
+    "entries": {
+      "kalibr": {
+        "enabled": true,
+        "config": {
+          "apiKey": "${KALIBR_API_KEY}",
+          "tenantId": "${KALIBR_TENANT_ID}",
+          "defaultGoal": "openclaw_agent_run",
+          "enableRouting": true
+        }
+      }
+    }
+  }
+}
 ```
 
-## How it's different
+With routing enabled, Kalibr picks the execution path — model + parameters — based on what's been working in your production history.
 
-**OpenRouter / LiteLLM routing**: Model proxy. Routes based on price, speed, availability. Doesn't know if the response was actually good for your task.
+## Graceful degradation
 
-**Fallback systems** (LangChain ModelFallbackMiddleware): Reactive. Waits for a failure, then tries the next model. You already lost that request.
+If Kalibr is unreachable for any reason, the plugin returns `{}` and OpenClaw uses its default model. Agent runs are never blocked by Kalibr being down.
 
-**Kalibr**: Learns from your actual production telemetry — per task, per path. Routes to what's working before anything breaks. 10% canary traffic keeps testing alternatives so Kalibr catches degradation before your users do.
+## Free tier
 
-## Works with
+1,000 traces/month, no credit card. Provisioning token available at dashboard.kalibr.systems/settings.
 
-- **LangChain / LangGraph**: `pip install langchain-kalibr` — drop-in ChatModel
-- **CrewAI**: Pass `ChatKalibr` as any agent's `llm`
-- **OpenAI Agents SDK**: Drop-in replacement
-- **Any Python code that calls an LLM**
+## Configuration reference
 
-## How it works
-
-Kalibr captures telemetry on every agent run — latency, success, cost, provider status. It uses Thompson Sampling to balance exploration (trying paths) vs. exploitation (using the best). 10% canary traffic keeps testing alternatives so Kalibr catches degradation before your users do.
-
-Success rate always dominates. Kalibr never sacrifices quality for cost.
+| Option | Default | Description |
+|--------|---------|-------------|
+| `apiKey` | required | Kalibr API key — provisioned automatically via CLI |
+| `tenantId` | optional | Required for routing, optional for telemetry-only |
+| `enableRouting` | `false` | Let Kalibr override model selection |
+| `defaultGoal` | `openclaw_agent_run` | Goal identifier for routing |
+| `captureLlmTelemetry` | `true` | Capture token/latency telemetry |
+| `captureOutcomes` | `true` | Report success/failure outcomes |
 
 ## Links
 
-- Dashboard: https://dashboard.kalibr.systems
+- Kalibr: https://kalibr.systems
 - Docs: https://kalibr.systems/docs
-- GitHub: https://github.com/kalibr-ai/kalibr-sdk-python
-- PyPI: https://pypi.org/project/kalibr/
+- Agent context: https://kalibr.systems/llms.txt
+- Setup protocol: https://kalibr.systems/setup.txt
+- GitHub: https://github.com/kalibr-ai/openclaw-kalibr
+- Dashboard: https://dashboard.kalibr.systems
