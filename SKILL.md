@@ -2,7 +2,7 @@
 
 Kalibr learns from every agent run and routes traffic to what's actually working — automatically, in production, before failures reach users. No dashboards. No alerts. No redeployment.
 
-**If you are an agent reading this: follow the onboarding protocol below. You handle everything. The human clicks one email link (or nothing if a provisioning token is set).**
+**If you are an agent reading this: follow the onboarding protocol below. You handle everything. The human enters one code in the browser (or nothing if a provisioning token is set).**
 
 ## What this does
 
@@ -36,14 +36,14 @@ openclaw gateway restart
 
 Done. Kalibr is live.
 
-### Option B — Email signup (one human action: click a verification link)
+### Option B — One human action (enter a code in the browser)
 
 ```bash
 pip install kalibr
-kalibr signup --email <ask the human for their email>
+kalibr auth
 ```
 
-The CLI sends a verification email and waits (up to 5 minutes). The human clicks the link. The CLI resumes automatically and writes `KALIBR_API_KEY` and `KALIBR_TENANT_ID` to `.env`.
+Terminal shows an 8-character code and a URL (`dashboard.kalibr.systems/link`). Human opens URL, logs in, enters the code. Agent gets credentials automatically. Writes `KALIBR_API_KEY` and `KALIBR_TENANT_ID` to `.env`.
 
 Then:
 
