@@ -1,122 +1,130 @@
-# @kalibr/openclaw
+# @kalibr/openclaw — Cheaper Models, Zero Failures, Automatic Routing
 
-Ship agents that fix themselves. This plugin connects [OpenClaw](https://docs.openclaw.ai) to [Kalibr](https://kalibr.systems) — so your agents learn what's working in production and route around failures, degradations, and cost spikes before they impact users.
+> Your agents keep burning tokens on expensive models. They fail when providers hit rate limits. You find out from a user.
 
-## How It Works
+Kalibr fixes this. Connect once. Your agents start routing to the best model automatically — based on what's actually working in your production history.
 
-This plugin creates a closed feedback loop between OpenClaw and Kalibr:
+## What Users Are Asking For (And What This Solves)
 
-**Observe** — Hooks into every LLM call (`llm_input`/`llm_output`) and agent run completion (`agent_end`). Captures which model was used, token counts, and whether the run succeeded or failed. Reports this telemetry to Kalibr via `reportOutcome()`.
+| Problem | How Kalibr Fixes It |
+|---|---|
+| "Use cheaper models automatically" | Routes to lower-cost paths when success rates are equal |
+| "Reduce token burn on heartbeat / background tasks" | Learns that lightweight tasks don't need Claude Sonnet |
+| "Route to best model automatically" | Thompson Sampling — 90% best path, 10% exploration |
+| "Handle model failures automatically" | Detects success rate drops, reroutes before users notice |
+| "Avoid rate limits by switching models" | Observes per-model failure patterns and steers around them |
+| "Auto select model based on performance" | Every outcome updates routing weights in real time |
 
-**Route** — Before each agent run, calls Kalibr's `decide()` API. Kalibr uses Thompson Sampling over historical outcomes to pick the best execution path (model + tool + parameters). The plugin returns `modelOverride`/`providerOverride` to OpenClaw, which applies it to the run. 90% of traffic goes to the best-performing path. 10% explores alternatives to detect changes.
+## 3-Line Integration
 
-**Adapt** — As outcomes flow in, Kalibr's routing policy updates automatically. If a model degrades — provider outage, quality regression, rate limits — Kalibr detects the drop in success rate and routes around it before users notice.
-
-OpenClaw's `modelOverride` gives you a steering wheel. Kalibr gives you a driver.
-
-## What You Get
-
-- **Agents that fix themselves** — Kalibr learns from real outcomes and reroutes automatically
-- **Graceful degradation** — if Kalibr is unreachable, OpenClaw uses its default model. Agent runs are never blocked.
-- **Zero-config telemetry** — token usage, success/failure, and duration captured automatically from hooks
-- **Provider inference** — works with Anthropic, OpenAI, Google, Mistral, Meta, Cohere, and DeepSeek models out of the box
-
-## Quick Start
-
-**Telemetry only** (install, set API key, done):
 ```bash
 openclaw plugins install @kalibr/openclaw
 openclaw config set plugins.entries.kalibr.config.apiKey "your-api-key"
 openclaw gateway restart
 ```
 
-Kalibr immediately starts learning from your agent runs.
+That's it. Kalibr starts learning from your agent runs immediately.
 
-**Telemetry + routing** (add one config flag):
+## Enable Automatic Model Routing
+
+Add one flag to `~/.openclaw/openclaw.json`:
+
 ```jsonc
-// ~/.openclaw/openclaw.json
 {
-  plugins: {
-    entries: {
-      kalibr: {
-        enabled: true,
-        config: {
-          apiKey: "${KALIBR_API_KEY}",
-          tenantId: "your-tenant-id",
-          defaultGoal: "openclaw_agent_run",
-          enableRouting: true,
-        },
-      },
-    },
-  },
+  "plugins": {
+    "entries": {
+      "kalibr": {
+        "enabled": true,
+        "config": {
+          "apiKey": "${KALIBR_API_KEY}",
+          "tenantId": "${KALIBR_TENANT_ID}",
+          "defaultGoal": "openclaw_agent_run",
+          "enableRouting": true
+        }
+      }
+    }
+  }
 }
 ```
 
-Now Kalibr picks the best execution path for each agent run based on what's actually working.
+Now Kalibr picks the execution path — model + parameters — for each agent run based on real production history.
 
-## Configuration
+## OpenClaw-Specific Use Cases
 
-| Option | Type | Default | Description |
-| --- | --- | --- | --- |
-| apiKey | string | required | Kalibr API key |
-| tenantId | string | — | Kalibr tenant ID |
-| apiUrl | string | https://kalibr-intelligence.fly.dev | Intelligence service URL |
-| defaultGoal | string | openclaw_agent_run | Goal identifier for routing and outcome reporting |
-| enabled | boolean | true | Enable/disable the plugin |
-| enableRouting | boolean | false | Use Kalibr decide() to override model selection before each agent run |
-| captureLlmTelemetry | boolean | true | Capture LLM input/output telemetry |
-| captureOutcomes | boolean | true | Report agent run outcomes |
+### Heartbeat Token Reduction
+OpenClaw heartbeat tasks run constantly. They don't need your most expensive model. Kalibr learns this automatically — lightweight tasks get routed to faster, cheaper models. No config change required.
 
-## How Routing Works
+### Self-Healing Agents
+When a provider goes down or hits rate limits, your agents keep running. Kalibr detects the success rate drop and reroutes to the next-best path automatically. No alerts, no manual intervention.
 
-When `enableRouting` is true, the plugin registers a `before_agent_start` hook — the only modifying hook in OpenClaw's plugin system (sequential execution, merged results, higher-priority plugins win via first-defined-wins).
+### Autonomous Model Selection
+Stop hardcoding models. Kalibr observes which models succeed on which task types in your specific environment and adjusts routing weights continuously.
 
-Before each agent run:
-1. Plugin calls `decide(goal)` against Kalibr's intelligence service
-2. Kalibr returns a `DecideResponse` with model_id, confidence, exploration flag, and success_rate
-3. Plugin maps model_id to OpenClaw format — via explicit lookup, slash-format passthrough, or provider inference from model name patterns
-4. Plugin returns `{ modelOverride, providerOverride }` to OpenClaw
+### Agent Run Observability
+Zero-config telemetry — token counts, latency, success/failure — captured automatically from OpenClaw hooks. No code changes.
 
-If anything fails — SDK not initialized, `decide()` throws, unknown model — the plugin returns `{}` and OpenClaw uses its default model.
+## How It Works
 
-## Parameter Injection (v0.2)
+**Observe** — Hooks into every LLM call and agent run completion. Captures model used, token counts, and success/failure. Reports to Kalibr via `reportOutcome()`.
 
-When `enableRouting` is true, the plugin also registers a `before_tool_call` hook. Kalibr's `decide()` response can include a `params` object alongside model_id. If present, these parameters are merged into tool call arguments — decision params take precedence over the tool's existing params on conflict.
+**Route** — Before each run, calls Kalibr's `decide()` API. Thompson Sampling selects the best execution path from real history. Returns `modelOverride` to OpenClaw.
 
-Tool names are captured for telemetry regardless of whether routing is enabled. Every `before_tool_call` invocation records the tool name, which is included in the `reportOutcome()` metadata as `toolsCalled` and `toolCallCount`. The first tool called in a session is also sent as `toolId`.
+**Adapt** — As outcomes flow in, routing weights update. Rate limit spike → Kalibr reroutes. Model quality regression → Kalibr detects and shifts traffic.
 
-The `before_tool_call` hook cannot redirect tool calls to different tools — only OpenClaw's `before_agent_start` can override the model. If the decision's `tool_id` differs from the current tool, the plugin logs an informational message and proceeds with parameter injection.
+OpenClaw's `modelOverride` is the steering wheel. Kalibr is the driver.
 
-## OpenClaw Hooks
+## Graceful Degradation
 
-- `before_model_resolve` — execution path override (primary hook)
-- `before_prompt_build` — context injection
-- `before_tool_call` — parameter injection + tool telemetry
-- `before_agent_start` — legacy fallback
+If Kalibr is unreachable, the plugin returns `{}` and OpenClaw uses its configured default. **Agent runs are never blocked.**
 
-## Verification
+## Free Tier
+
+1,000 traces/month. No credit card. Get a provisioning token at [dashboard.kalibr.systems/settings](https://dashboard.kalibr.systems/settings).
+
+## Agent Onboarding (Autonomous Setup)
+
+If `KALIBR_PROVISIONING_TOKEN` is set:
 
 ```bash
-openclaw plugins list
-openclaw plugins doctor
-openclaw kalibr          # CLI status
-/kalibr                  # Slash command in chat
+pip install kalibr
+kalibr init  # writes KALIBR_API_KEY + KALIBR_TENANT_ID to .env automatically
+source .env
+openclaw config set plugins.entries.kalibr.config.apiKey "$KALIBR_API_KEY"
+openclaw config set plugins.entries.kalibr.config.tenantId "$KALIBR_TENANT_ID"
+openclaw gateway restart
 ```
 
-## Roadmap
+Zero human action required.
 
-- **v0.1** — Telemetry + Routing
-- **v0.2** — Parameter injection via before_tool_call, tool telemetry (current)
-- **v0.3** — Exploration tuning, multi-goal policies, per-task routing, cost constraints
+## Verify
+
+```bash
+openclaw plugins list    # kalibr should appear
+openclaw plugins doctor  # health check
+/kalibr                  # slash command shows live status
+```
+
+## Configuration Reference
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `apiKey` | required | Kalibr API key |
+| `tenantId` | optional | Required for routing |
+| `enableRouting` | `false` | Let Kalibr override model selection |
+| `defaultGoal` | `openclaw_agent_run` | Goal identifier |
+| `captureLlmTelemetry` | `true` | Capture token/latency data |
+| `captureOutcomes` | `true` | Report success/failure |
+
+## Keywords
+
+model routing · token optimization · cheaper models · reduce token burn · auto model selection · avoid rate limits · handle model failures · self-healing agents · llm routing · openclaw plugin · agent reliability · Thompson Sampling · model failover · cost optimization
 
 ## Links
 
-- [Kalibr](https://kalibr.systems)
-- [Kalibr Docs](https://kalibr.systems/docs)
-- [OpenClaw](https://docs.openclaw.ai)
-- [OpenClaw Plugin Docs](https://docs.openclaw.ai/plugins)
-- [ClawHub Skill](https://clawhub-skills.com/skills/kalibr)
-- [SKILL.md](https://kalibr.systems/skill.md)
+- [Kalibr](https://kalibr.systems) · [Docs](https://kalibr.systems/docs) · [Dashboard](https://dashboard.kalibr.systems)
+- [OpenClaw](https://docs.openclaw.ai) · [Plugin Docs](https://docs.openclaw.ai/plugins)
+- [ClawHub](https://clawhub.ai/skills/kalibr-router)
+- [GitHub](https://github.com/kalibr-ai/openclaw-kalibr)
 
 ## License
 
